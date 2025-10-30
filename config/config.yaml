@@ -1,0 +1,54 @@
+# Default Configuration for Sentiment Analyzer
+# This file can be customized for different environments
+
+# Sentiment thresholds
+thresholds:
+  positive_threshold: 0.05   # Score above this is POSITIVE
+  negative_threshold: -0.05  # Score below this is NEGATIVE
+  # Scores between thresholds are NEUTRAL
+
+# Text processing limits
+limits:
+  max_text_length: 10000      # Maximum characters to process
+  min_text_length: 1          # Minimum characters required
+  max_processing_time_ms: 5000 # Timeout for processing
+  max_emoji_only_length: 50   # Max emojis for emoji-only text
+
+# VADER configuration
+vader:
+  enabled: true
+  include_emoji: true          # Include emoji in VADER analysis
+  boost_negation: true         # Boost negation handling
+  alpha: 0.75                  # Normalization parameter
+
+# LLM configuration (mocked by default)
+llm:
+  enabled: true
+  model_name: "gpt-3.5-turbo"
+  temperature: 0.0             # 0 for consistent results
+  max_tokens: 100
+  timeout_seconds: 10
+  retry_attempts: 3
+  retry_delay_seconds: 1.0
+  mock_mode: true              # Use mock LLM for testing
+
+# Caching configuration
+cache:
+  enabled: true
+  ttl_seconds: 3600            # Cache for 1 hour
+  max_size: 1000               # Maximum cached items
+
+# Logging configuration
+logging:
+  level: "INFO"                # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  enable_metrics: true
+
+# Feature flags
+enable_fallback: true          # Fallback to VADER if LLM fails
+enable_emoji_analysis: true    # Analyze emoji sentiment
+enable_language_detection: false # Auto-detect language
+
+# Supported languages (for future expansion)
+supported_languages:
+  - "en"
