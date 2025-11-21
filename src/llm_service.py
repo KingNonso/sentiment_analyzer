@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 from .exceptions import ExternalServiceError, RateLimitError
 from .config import LLMConfig
 from .utils import calculate_text_hash, normalize_score
+from .rate_limiter import RateLimiter, global_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -64,17 +65,22 @@ class MockLLMProvider(LLMProvider):
         self.request_count = 0
         self.last_request_time = 0
         self.failure_rate = 0.05  # 5% failure rate for testing resilience
+        self.service_name = "mock-llm"
+        
+        # Initialize rate limiter for this provider
+        if self.service_name not in global_rate_limiter.limiters:
+            global_rate_limiter.add_limiter(self.service_name, requests_per_second=10, burst_capacity=20)
         
     def analyze_sentiment(self, text: str, config: LLMConfig) -> LLMResponse:
         """Simulate LLM sentiment analysis with realistic behavior."""
         start_time = time.perf_counter()
         
-        # Simulate rate limiting
-        if self.request_count > 10 and time.time() - self.last_request_time < 1:
+        # Proactive rate limiting - acquire token before making request
+        if not global_rate_limiter.acquire(self.service_name, timeout=config.timeout_seconds):
             raise RateLimitError(
-                "Rate limit exceeded",
-                service_name="MockLLM",
-                retry_after=60
+                "Rate limit would be exceeded - request throttled",
+                service_name=self.service_name,
+                retry_after=int(global_rate_limiter.limiters[self.service_name].get_wait_time())
             )
         
         self.request_count += 1
@@ -187,9 +193,26 @@ class OpenAIProvider(LLMProvider):
     In production, this would use the actual OpenAI API.
     """
     
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, model_name: str = "gpt-3.5-turbo"):
         self.api_key = api_key
+        self.model_name = model_name
         self.mock_provider = MockLLMProvider()  # Fallback to mock
+        
+        # Determine service name based on model
+        if "gpt-4" in model_name:
+            self.service_name = "openai-gpt-4"
+            requests_per_second = 1
+            burst_capacity = 5
+        else:
+            self.service_name = "openai-gpt-3.5"
+            requests_per_second = 3
+            burst_capacity = 10
+            
+        # Initialize rate limiter for this provider
+        if self.service_name not in global_rate_limiter.limiters:
+            global_rate_limiter.add_limiter(self.service_name, 
+                                           requests_per_second=requests_per_second,
+                                           burst_capacity=burst_capacity)
         
     def analyze_sentiment(self, text: str, config: LLMConfig) -> LLMResponse:
         """Analyze sentiment using OpenAI API (mocked)."""
@@ -197,8 +220,16 @@ class OpenAIProvider(LLMProvider):
             logger.info("Using mock mode for OpenAI provider")
             return self.mock_provider.analyze_sentiment(text, config)
         
+        # Proactive rate limiting for actual API calls
+        if not global_rate_limiter.acquire(self.service_name, timeout=config.timeout_seconds):
+            raise RateLimitError(
+                f"Rate limit would be exceeded for {self.service_name} - request throttled",
+                service_name=self.service_name,
+                retry_after=int(global_rate_limiter.limiters[self.service_name].get_wait_time())
+            )
+        
         # In production, this would make actual API calls
-        # For now, we use the mock provider
+        # For now, we use the mock provider after rate limiting
         return self.mock_provider.analyze_sentiment(text, config)
     
     def is_available(self) -> bool:
@@ -227,10 +258,13 @@ class LLMService:
         providers = {}
         
         if self.config.model_name.startswith('gpt'):
-            providers['openai'] = OpenAIProvider(self.config.api_key)
+            providers['openai'] = OpenAIProvider(self.config.api_key, self.config.model_name)
         
         # Always include mock provider as fallback
         providers['mock'] = MockLLMProvider()
+        
+        # Configure default rate limits for all services
+        global_rate_limiter.configure_default_limits()
         
         return providers
     
@@ -266,7 +300,12 @@ class LLMService:
                 
             except RateLimitError as e:
                 logger.warning(f"Rate limit hit: {e}")
-                if attempt < self.config.retry_attempts - 1:
+                # With proactive rate limiting, this should rarely happen
+                # But if it does, we can check if we should wait or fallback
+                if e.retry_after and e.retry_after < self.config.timeout_seconds:
+                    logger.info(f"Waiting {e.retry_after}s for rate limit to reset")
+                    time.sleep(e.retry_after)
+                elif attempt < self.config.retry_attempts - 1:
                     time.sleep(self.config.retry_delay_seconds * (attempt + 1))
                 else:
                     # Try fallback provider

@@ -46,6 +46,22 @@ class LimitsConfig:
 
 
 @dataclass
+class RateLimitConfig:
+    """Configuration for API rate limiting."""
+    enabled: bool = True
+    openai_gpt35_rps: float = 3.0  # Requests per second for GPT-3.5
+    openai_gpt35_burst: int = 10
+    openai_gpt4_rps: float = 1.0  # Requests per second for GPT-4
+    openai_gpt4_burst: int = 5
+    anthropic_claude_rps: float = 2.0  # Requests per second for Claude
+    anthropic_claude_burst: int = 5
+    youtube_api_rps: float = 100.0  # Requests per second for YouTube API
+    youtube_api_burst: int = 200
+    mock_llm_rps: float = 10.0  # Requests per second for mock LLM
+    mock_llm_burst: int = 20
+
+
+@dataclass
 class LLMConfig:
     """Configuration for LLM-based analysis (mocked in this implementation)."""
     enabled: bool = True
@@ -57,6 +73,7 @@ class LLMConfig:
     retry_attempts: int = 3
     retry_delay_seconds: float = 1.0
     mock_mode: bool = field(default_factory=lambda: os.getenv("MOCK_LLM", "true").lower() == "true")
+    rate_limits: RateLimitConfig = field(default_factory=RateLimitConfig)
 
 
 @dataclass
@@ -96,6 +113,7 @@ class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     vader: VADERConfig = field(default_factory=VADERConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
+    rate_limits: RateLimitConfig = field(default_factory=RateLimitConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     
     # Feature flags
