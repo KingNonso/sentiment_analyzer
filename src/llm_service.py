@@ -15,10 +15,14 @@ from dataclasses import dataclass
 import logging
 from abc import ABC, abstractmethod
 
-from .exceptions import ExternalServiceError, RateLimitError
+from .exceptions import (ExternalServiceError, RateLimitError, 
+                        LLMProviderError, LLMNotInitializedError,
+                        LLMTimeoutError, TextTooLongError,
+                        NoProvidersAvailableError, CacheError,
+                        TextProcessingError)
 from .config import LLMConfig
 from .utils import calculate_text_hash, normalize_score
-from .rate_limiter import RateLimiter, global_rate_limiter
+from .rate_limiter import global_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -75,12 +79,37 @@ class MockLLMProvider(LLMProvider):
         """Simulate LLM sentiment analysis with realistic behavior."""
         start_time = time.perf_counter()
         
+        # Validate input
+        if not text:
+            raise TextProcessingError(
+                "Empty text provided for analysis",
+                details={"provider": self.service_name}
+            )
+        
+        if len(text) > config.max_tokens * 4:  # Rough character to token ratio
+            raise TextTooLongError(
+                text_length=len(text),
+                max_length=config.max_tokens * 4,
+                details={"provider": self.service_name}
+            )
+        
         # Proactive rate limiting - acquire token before making request
-        if not global_rate_limiter.acquire(self.service_name, timeout=config.timeout_seconds):
-            raise RateLimitError(
-                "Rate limit would be exceeded - request throttled",
-                service_name=self.service_name,
-                retry_after=int(global_rate_limiter.limiters[self.service_name].get_wait_time())
+        try:
+            if not global_rate_limiter.acquire(self.service_name, timeout=config.timeout_seconds):
+                wait_time = global_rate_limiter.limiters[self.service_name].get_wait_time()
+                raise RateLimitError(
+                    "Rate limit would be exceeded - request throttled",
+                    service_name=self.service_name,
+                    retry_after=int(wait_time),
+                    details={
+                        "wait_time": wait_time,
+                        "request_count": self.request_count
+                    }
+                )
+        except KeyError as e:
+            logger.warning(
+                "rate_limiter_not_configured",
+                extra={"service": self.service_name, "error": str(e)}
             )
         
         self.request_count += 1
@@ -88,10 +117,19 @@ class MockLLMProvider(LLMProvider):
         
         # Simulate occasional failures
         if random.random() < self.failure_rate:
+            logger.warning(
+                "mock_service_failure_simulated",
+                extra={
+                    "service": self.service_name,
+                    "request_count": self.request_count,
+                    "failure_rate": self.failure_rate
+                }
+            )
             raise ExternalServiceError(
                 "Mock LLM service temporarily unavailable",
                 service_name="MockLLM",
-                status_code=503
+                status_code=503,
+                details={"simulated": True}
             )
         
         # Simulate processing time (20-200ms)
@@ -217,16 +255,48 @@ class OpenAIProvider(LLMProvider):
     def analyze_sentiment(self, text: str, config: LLMConfig) -> LLMResponse:
         """Analyze sentiment using OpenAI API (mocked)."""
         if config.mock_mode or not self.api_key:
-            logger.info("Using mock mode for OpenAI provider")
+            logger.info(
+                "openai_mock_mode",
+                extra={
+                    "model": self.model_name,
+                    "has_api_key": bool(self.api_key),
+                    "mock_mode": config.mock_mode
+                }
+            )
             return self.mock_provider.analyze_sentiment(text, config)
         
-        # Proactive rate limiting for actual API calls
-        if not global_rate_limiter.acquire(self.service_name, timeout=config.timeout_seconds):
-            raise RateLimitError(
-                f"Rate limit would be exceeded for {self.service_name} - request throttled",
-                service_name=self.service_name,
-                retry_after=int(global_rate_limiter.limiters[self.service_name].get_wait_time())
+        # Check if provider is properly initialized
+        if not self.api_key:
+            raise LLMNotInitializedError(
+                provider_name="OpenAI",
+                reason="API key not provided",
+                details={"model": self.model_name}
             )
+        
+        # Proactive rate limiting for actual API calls
+        try:
+            if not global_rate_limiter.acquire(self.service_name, timeout=config.timeout_seconds):
+                wait_time = global_rate_limiter.limiters[self.service_name].get_wait_time()
+                raise RateLimitError(
+                    f"Rate limit would be exceeded for {self.service_name} - request throttled",
+                    service_name=self.service_name,
+                    retry_after=int(wait_time),
+                    details={
+                        "model": self.model_name,
+                        "wait_time": wait_time
+                    }
+                )
+        except Exception as e:
+            logger.error(
+                "rate_limiting_error",
+                extra={
+                    "service": self.service_name,
+                    "error": str(e),
+                    "error_type": type(e).__name__
+                },
+                exc_info=True
+            )
+            # Continue without rate limiting if there's an error
         
         # In production, this would make actual API calls
         # For now, we use the mock provider after rate limiting
@@ -278,46 +348,178 @@ class LLMService:
             LLMResponse with sentiment analysis results
             
         Raises:
-            ExternalServiceError: If all providers fail
+            NoProvidersAvailableError: If all providers fail
+            TextTooLongError: If text exceeds maximum length
         """
+        # Validate input
+        if not text or not text.strip():
+            raise TextProcessingError(
+                "Empty or whitespace-only text provided",
+                details={"text_length": len(text) if text else 0}
+            )
+        
+        # Check text length
+        max_chars = self.config.max_tokens * 4  # Rough estimate
+        if len(text) > max_chars:
+            logger.warning(
+                "text_truncated",
+                extra={
+                    "original_length": len(text),
+                    "max_length": max_chars,
+                    "truncated_to": max_chars
+                }
+            )
+            text = text[:max_chars]
+        
         # Check cache first
         text_hash = calculate_text_hash(text)
-        if text_hash in self.cache:
-            logger.debug(f"Cache hit for text hash: {text_hash}")
-            return self.cache[text_hash]
+        try:
+            if text_hash in self.cache:
+                logger.debug(
+                    "cache_hit",
+                    extra={
+                        "text_hash": text_hash,
+                        "cache_size": len(self.cache)
+                    }
+                )
+                return self.cache[text_hash]
+        except Exception as e:
+            logger.warning(
+                "cache_lookup_failed",
+                extra={"error": str(e), "text_hash": text_hash}
+            )
         
         # Try primary provider
         primary_provider = self._get_primary_provider()
+        attempted_providers = []
         
         for attempt in range(self.config.retry_attempts):
             try:
+                logger.debug(
+                    "attempting_analysis",
+                    extra={
+                        "provider": primary_provider.__class__.__name__,
+                        "attempt": attempt + 1,
+                        "text_length": len(text)
+                    }
+                )
+                
                 response = primary_provider.analyze_sentiment(text, self.config)
                 
                 # Cache the result
-                self._cache_response(text_hash, response)
+                try:
+                    self._cache_response(text_hash, response)
+                except Exception as e:
+                    logger.warning(
+                        "cache_write_failed",
+                        extra={"error": str(e), "text_hash": text_hash}
+                    )
+                
+                logger.info(
+                    "analysis_successful",
+                    extra={
+                        "provider": primary_provider.__class__.__name__,
+                        "sentiment_score": response.sentiment_score,
+                        "confidence": response.confidence,
+                        "response_time_ms": response.response_time_ms
+                    }
+                )
                 
                 return response
                 
             except RateLimitError as e:
-                logger.warning(f"Rate limit hit: {e}")
+                logger.warning(
+                    "rate_limit_hit",
+                    extra={
+                        "service": e.service_name,
+                        "retry_after": e.retry_after,
+                        "attempt": attempt + 1,
+                        "details": e.details
+                    }
+                )
+                attempted_providers.append(e.service_name)
+                
                 # With proactive rate limiting, this should rarely happen
                 # But if it does, we can check if we should wait or fallback
                 if e.retry_after and e.retry_after < self.config.timeout_seconds:
-                    logger.info(f"Waiting {e.retry_after}s for rate limit to reset")
+                    logger.info(
+                        "waiting_for_rate_limit",
+                        extra={"wait_time": e.retry_after}
+                    )
                     time.sleep(e.retry_after)
                 elif attempt < self.config.retry_attempts - 1:
-                    time.sleep(self.config.retry_delay_seconds * (attempt + 1))
+                    wait_time = self.config.retry_delay_seconds * (attempt + 1)
+                    logger.debug(
+                        "retry_delay",
+                        extra={"wait_time": wait_time, "attempt": attempt + 1}
+                    )
+                    time.sleep(wait_time)
                 else:
                     # Try fallback provider
-                    return self._try_fallback(text)
+                    return self._try_fallback(text, attempted_providers)
                     
+            except LLMTimeoutError as e:
+                logger.error(
+                    "llm_timeout",
+                    extra={
+                        "provider": e.service_name,
+                        "timeout": e.timeout_seconds,
+                        "attempt": attempt + 1
+                    }
+                )
+                attempted_providers.append(e.service_name)
+                
+                if attempt < self.config.retry_attempts - 1:
+                    time.sleep(self.config.retry_delay_seconds)
+                else:
+                    return self._try_fallback(text, attempted_providers)
+                    
+            except (LLMNotInitializedError, TextProcessingError) as e:
+                # These are unrecoverable errors - don't retry
+                logger.error(
+                    "unrecoverable_error",
+                    extra={
+                        "error_type": type(e).__name__,
+                        "error": str(e),
+                        "details": getattr(e, 'details', {})
+                    }
+                )
+                raise
+                
             except ExternalServiceError as e:
-                logger.error(f"LLM service error: {e}")
+                logger.error(
+                    "llm_service_error",
+                    extra={
+                        "service": e.service_name,
+                        "status_code": e.status_code,
+                        "attempt": attempt + 1,
+                        "details": e.details
+                    }
+                )
+                attempted_providers.append(e.service_name)
+                
                 if attempt < self.config.retry_attempts - 1:
                     time.sleep(self.config.retry_delay_seconds)
                 else:
                     # Try fallback provider
-                    return self._try_fallback(text)
+                    return self._try_fallback(text, attempted_providers)
+                    
+            except Exception as e:
+                logger.exception(
+                    "unexpected_llm_error",
+                    extra={
+                        "error_type": type(e).__name__,
+                        "error": str(e),
+                        "attempt": attempt + 1
+                    }
+                )
+                
+                if attempt >= self.config.retry_attempts - 1:
+                    raise LLMProviderError(
+                        f"Unexpected error during analysis: {e}",
+                        service_name=primary_provider.__class__.__name__,
+                        details={"original_error": str(e)}
+                    ) from e
         
         raise ExternalServiceError(
             "All LLM providers failed",
@@ -326,23 +528,66 @@ class LLMService:
     
     def _get_primary_provider(self) -> LLMProvider:
         """Get the primary LLM provider."""
-        if 'openai' in self.providers and self.providers['openai'].is_available():
-            return self.providers['openai']
-        return self.providers['mock']
+        # For now, return the first available provider
+        for provider in self.providers.values():
+            if provider.is_available():
+                return provider
+        raise NoProvidersAvailableError(
+            attempted_providers=list(self.providers.keys()),
+            details={"available_providers": list(self.providers.keys())}
+        )
     
-    def _try_fallback(self, text: str) -> LLMResponse:
-        """Try fallback provider when primary fails."""
-        logger.info("Attempting fallback to mock provider")
+    def _try_fallback(self, text: str, attempted_providers: list[str] | None = None) -> LLMResponse:
+        """Try fallback provider when primary fails.
         
-        if 'mock' in self.providers:
+        Args:
+            text: Text to analyze
+            attempted_providers: List of providers that have already been attempted
+            
+        Returns:
+            LLMResponse from fallback provider
+            
+        Raises:
+            NoProvidersAvailableError: If all fallback attempts fail
+        """
+        attempted_providers = attempted_providers or []
+        
+        if 'mock' in self.providers and 'mock' not in attempted_providers:
+            logger.info(
+                "falling_back_to_mock",
+                extra={
+                    "attempted_providers": attempted_providers,
+                    "text_length": len(text)
+                }
+            )
             try:
-                return self.providers['mock'].analyze_sentiment(text, self.config)
+                response = self.providers['mock'].analyze_sentiment(text, self.config)
+                logger.info(
+                    "fallback_successful",
+                    extra={
+                        "provider": "mock",
+                        "sentiment_score": response.sentiment_score
+                    }
+                )
+                return response
             except Exception as e:
-                logger.error(f"Fallback provider also failed: {e}")
+                logger.error(
+                    "fallback_provider_failed",
+                    extra={
+                        "provider": "mock",
+                        "error": str(e),
+                        "error_type": type(e).__name__
+                    }
+                )
+                attempted_providers.append('mock')
         
-        raise ExternalServiceError(
-            "No available LLM providers",
-            service_name="LLMService"
+        # No more providers available
+        raise NoProvidersAvailableError(
+            attempted_providers=attempted_providers,
+            details={
+                "text_length": len(text),
+                "available_providers": list(self.providers.keys())
+            }
         )
     
     def _cache_response(self, text_hash: str, response: LLMResponse) -> None:
