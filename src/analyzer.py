@@ -17,7 +17,7 @@ import time
 from typing import Optional, Dict, Any
 from functools import lru_cache
 
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer as VaderAnalyzer # does not exist
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer as VaderAnalyzer 
 
 from .models import SentimentResult, SentimentLabel
 from .exceptions import (
@@ -222,6 +222,24 @@ class SentimentAnalyzer:
         if processed['emojis'] and self.config.enable_emoji_analysis:
             emoji_score, emoji_confidence = calculate_emoji_sentiment(processed['emojis'])
             if emoji_confidence > 0.5:
+                """
+                Why 70/30 Split?
+                Text is primary signal (70%) - The actual words carry more semantic meaning and context than emojis alone
+                Emojis are supplementary (30%) - Emojis reinforce or clarify sentiment but shouldn't override text meaning
+                Example
+                For "The product is okay 😍😍😍":
+
+                VADER might score the text as ~0.2 (mildly positive)
+                Emoji score would be ~0.9 (very positive)
+                Combined: (0.2 * 0.7) + (0.9 * 0.3) = 0.14 + 0.27 = 0.41
+                The emojis boost the score, but don't completely override the lukewarm text.
+
+                Why Not 50/50?
+                If someone writes "I hate this product 😂", the laughing emoji might indicate sarcasm, but it could also just be nervous laughter. Giving text more weight prevents emojis from flipping the sentiment entirely when the text is clear.
+
+                The Guard Condition
+                Note this only applies when emoji_confidence > 0.5 (line 224) - meaning we only blend emoji sentiment when we recognize enough of the emojis to be confident about their meaning.
+                """
                 # Weighted average with emoji sentiment
                 compound_score = (compound_score * 0.7) + (emoji_score * 0.3)
         
@@ -365,10 +383,14 @@ class SentimentAnalyzer:
         Returns:
             Confidence score between 0 and 1
         """
+
+        # Detect mixed sentiment from VADER scores (both neg and pos are significant)
+        has_mixed_sentiment = vader_scores['neg'] > 0.1 and vader_scores['pos'] > 0.1
+        
         base_confidence = get_confidence_from_score(vader_scores['compound'])
         
-        # Adjust for mixed sentiment
-        if processed['has_mixed_sentiment']:
+        # Adjust for mixed sentiment (from VADER scores or keyword detection)
+        if has_mixed_sentiment or processed['has_mixed_sentiment']:
             base_confidence *= 0.8
         
         # Adjust for text length (shorter texts have lower confidence)
