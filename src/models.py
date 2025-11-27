@@ -58,3 +58,4 @@ class AnalysisMetrics:
     word_count: int
     has_mixed_sentiment: bool
     language_detected: Optional[str] = None
+    

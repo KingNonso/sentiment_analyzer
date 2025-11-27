@@ -1,7 +1,6 @@
 """Configuration management for the sentiment analyzer.
 
 Implements configuration using:
-- Pydantic for validation and type safety
 - Environment variables for sensitive data
 - YAML for default configurations
 - Override hierarchy: ENV > config file > defaults

@@ -113,7 +113,7 @@ def detect_mixed_sentiment(text: str) -> bool:
     """
     positive_indicators = [
         'love', 'great', 'awesome', 'excellent', 'good', 'wonderful',
-        'fantastic', 'amazing', 'best', 'happy', 'joy', 'excited', 'quality'
+        'fantastic', 'amazing', 'best', 'happy', 'joy', 'excited', 'quality', 'fire', 'lit', 'cool'
     ]
     negative_indicators = [
         'hate', 'terrible', 'awful', 'horrible', 'bad', 'worst',
